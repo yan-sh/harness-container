@@ -1,0 +1,378 @@
+#!/usr/bin/env python3.11
+"""Run a configured coding harness inside a Linux container."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+
+
+ROOT = Path(__file__).resolve().parent
+COMMANDS = {"claude": "claude", "codex": "codex", "opencode": "opencode", "pi": "pi"}
+STATE_PATHS = {
+    "claude": [".claude", ".claude.json"],
+    "codex": [".codex"],
+    "opencode": [".config/opencode", ".local/share/opencode"],
+    "pi": [".pi"],
+}
+PREFERENCE = {
+    "linux": ["podman", "docker"],
+    "macos": ["docker", "podman"],
+    "windows": ["docker"],
+}
+VARIABLE = re.compile(r"\$\{([A-Z_]+)\}")
+NIX_PACKAGE = re.compile(r"^[A-Za-z0-9._+@/?#:=,\-]+$")
+NIX_KEY = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def table(value: object, label: str) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{label} must be a TOML table")
+    return value
+
+
+def string(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} must be a string")
+    return value
+
+
+def strings(value: object, label: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ConfigError(f"{label} must be an array of strings")
+    return value
+
+
+def boolean(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label} must be true or false")
+    return value
+
+
+def host_os() -> str:
+    name = platform.system().lower()
+    if name == "darwin":
+        return "macos"
+    if name == "windows":
+        return "windows"
+    if name == "linux":
+        try:
+            release = Path("/proc/sys/kernel/osrelease").read_text().lower()
+        except OSError:
+            release = ""
+        return "windows" if "microsoft" in release or "wsl" in release else "linux"
+    raise ConfigError(f"Unsupported host OS: {name}")
+
+
+def container_platform() -> str:
+    arch = platform.machine().lower()
+    if arch in {"x86_64", "amd64"}:
+        return "linux-amd64"
+    if arch in {"aarch64", "arm64"}:
+        return "linux-arm64"
+    raise ConfigError(f"Unsupported CPU architecture: {arch}")
+
+
+def expand(value: str, values: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise ConfigError(f"Unknown path variable: ${{{key}}}")
+        return values[key]
+
+    expanded = VARIABLE.sub(replace, value)
+    if "${" in expanded:
+        raise ConfigError(f"Invalid path variable in: {value}")
+    return expanded
+
+
+def host_path(value: str, values: dict[str, str], base: Path) -> Path:
+    path = Path(expand(value, values)).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve(strict=False)
+
+
+def target_path(value: str, label: str) -> str:
+    target = PurePosixPath(string(value, label))
+    if not target.is_absolute() or ".." in target.parts or str(target) == "/":
+        raise ConfigError(f"{label} must be an absolute container path other than /")
+    return str(target)
+
+
+def mode(value: object, label: str) -> str:
+    if not isinstance(value, str) or value not in {"ro", "rw"}:
+        raise ConfigError(f"{label} must be ro or rw")
+    return str(value)
+
+
+def keys(data: dict, allowed: set[str], label: str) -> None:
+    unknown = set(data) - allowed
+    if unknown:
+        raise ConfigError(f"Unknown {label} setting(s): {', '.join(sorted(unknown))}")
+
+
+def mount(source: Path, target: str, access: str, create: bool = False, kind: str = "dir") -> dict:
+    if "," in str(source) or "," in target or "\n" in str(source) or "\n" in target:
+        raise ConfigError("Mount paths cannot contain commas or newlines")
+    return {"source": str(source), "target": target, "mode": access, "create": create, "kind": kind}
+
+
+def check_mounts(mounts: list[dict]) -> None:
+    for index, left in enumerate(mounts):
+        for right in mounts[index + 1 :]:
+            a, b = PurePosixPath(left["target"]), PurePosixPath(right["target"])
+            if a == b or a in b.parents or b in a.parents:
+                raise ConfigError(f"Overlapping container mounts: {a} and {b}")
+
+
+def load_config(path: Path) -> dict:
+    try:
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except OSError as exc:
+        raise ConfigError(f"Cannot read {path}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
+    if type(config.get("version")) is not int or config["version"] != 1:
+        raise ConfigError("version must be 1")
+    keys(config, {"version", "harness", "runtime", "workspace", "mounts", "software"}, "top-level")
+    return config
+
+
+def choose_runtime(config: dict, system: str, dry_run: bool) -> str:
+    settings = table(config.get("runtime"), "runtime")
+    keys(settings, {"engine", "linux_preference", "macos_preference", "windows_preference"}, "runtime")
+    engine = string(settings.get("engine", "auto"), "runtime.engine")
+    if engine not in {"auto", "docker", "podman"}:
+        raise ConfigError("runtime.engine must be auto, docker or podman")
+    if engine == "auto":
+        key = f"{system}_preference"
+        order = strings(settings.get(key, PREFERENCE[system]), f"runtime.{key}")
+    else:
+        order = [engine]
+    if not order or any(item not in {"docker", "podman"} for item in order):
+        raise ConfigError("Runtime preference must list docker and/or podman")
+    failures = []
+    for candidate in order:
+        binary = shutil.which(candidate)
+        if not binary:
+            failures.append(f"{candidate}: command not found")
+            continue
+        if dry_run:
+            return candidate
+        try:
+            result = subprocess.run([binary, "info"], capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            failures.append(f"{candidate}: engine did not answer within 10 seconds")
+            continue
+        if result.returncode:
+            failures.append(f"{candidate}: {result.stderr.strip() or 'daemon unavailable'}")
+            continue
+        if candidate == "docker":
+            os_result = subprocess.run(
+                [binary, "info", "--format", "{{.OSType}}"], capture_output=True, text=True
+            )
+            if os_result.returncode or os_result.stdout.strip() != "linux":
+                failures.append("docker: Linux container engine is required")
+                continue
+        return candidate
+    raise ConfigError("No usable container runtime: " + "; ".join(failures))
+
+
+def prepare(plan: dict) -> None:
+    for item in plan["mounts"]:
+        path = Path(item["source"])
+        if not path.exists() and item["create"]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if item["kind"] == "file":
+                path.write_text("{}\n", encoding="utf-8")
+            else:
+                path.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            raise ConfigError(f"Mount source does not exist: {path}")
+        if item["kind"] == "file" and not path.is_file():
+            raise ConfigError(f"Expected a file: {path}")
+        if item["kind"] == "dir" and not path.is_dir():
+            raise ConfigError(f"Expected a directory: {path}")
+
+
+def image_tag(harness: str) -> str:
+    digest = hashlib.sha256()
+    for relative in ("Containerfile", "container/entrypoint.sh", "container/launch.sh", "container/run-in-nix.sh"):
+        digest.update((ROOT / relative).read_bytes())
+    digest.update(harness.encode())
+    return f"harness-container:{harness}-{digest.hexdigest()[:12]}"
+
+
+def make_plan(config: dict, config_path: Path, cwd: Path, dry_run: bool, extra: list[str]) -> dict:
+    values = {
+        "HOME": str(Path.home()),
+        "CWD": str(cwd),
+        "CONFIG_DIR": str(config_path.parent),
+        "CONTAINER_PLATFORM": container_platform(),
+    }
+    harness = table(config.get("harness"), "harness")
+    keys(harness, {"name", "args", "state"}, "harness")
+    name = string(harness.get("name"), "harness.name")
+    if name not in COMMANDS:
+        raise ConfigError("harness.name must be claude, codex, opencode or pi")
+    args = strings(harness.get("args", []), "harness.args") + extra
+    system = host_os()
+    engine = choose_runtime(config, system, dry_run)
+    workspace = table(config.get("workspace"), "workspace")
+    keys(workspace, {"source", "target", "mode"}, "workspace")
+    source = host_path(string(workspace.get("source", "${CWD}"), "workspace.source"), values, config_path.parent)
+    if not source.is_dir():
+        raise ConfigError(f"Workspace must be an existing directory: {source}")
+    default_target = "/" + source.name
+    target = target_path(workspace.get("target", default_target), "workspace.target")
+    mounts = [mount(source, target, mode(workspace.get("mode", "rw"), "workspace.mode"))]
+
+    state = table(harness.get("state"), "harness.state")
+    keys(state, {"enabled", "paths", "mode"}, "harness.state")
+    if boolean(state.get("enabled", True), "harness.state.enabled"):
+        state_mode = mode(state.get("mode", "rw"), "harness.state.mode")
+        paths = strings(state.get("paths", STATE_PATHS[name]), "harness.state.paths")
+        home = Path.home().resolve()
+        for raw in paths:
+            state_source = host_path(raw if "${" in raw or raw.startswith(("/", "~")) else "${HOME}/" + raw, values, config_path.parent)
+            try:
+                relative = state_source.relative_to(home)
+            except ValueError as exc:
+                raise ConfigError(f"Harness state path must be inside HOME: {state_source}") from exc
+            is_file = state_source.suffix == ".json" or state_source.is_file()
+            state_target = target_path("/home/agent/" + relative.as_posix(), "harness.state.paths")
+            mounts.append(mount(state_source, state_target, state_mode, True, "file" if is_file else "dir"))
+
+    extras = config.get("mounts", [])
+    if not isinstance(extras, list):
+        raise ConfigError("mounts must be an array of tables")
+    for index, item in enumerate(extras):
+        entry = table(item, f"mounts[{index}]")
+        keys(entry, {"source", "target", "mode", "create"}, f"mounts[{index}]")
+        extra_source = host_path(string(entry.get("source"), f"mounts[{index}].source"), values, config_path.parent)
+        extra_target = target_path(entry.get("target"), f"mounts[{index}].target")
+        access = mode(entry.get("mode", "ro"), f"mounts[{index}].mode")
+        create = boolean(entry.get("create", False), f"mounts[{index}].create")
+        mounts.append(mount(extra_source, extra_target, access, create, "file" if extra_source.is_file() else "dir"))
+
+    software = table(config.get("software"), "software")
+    keys(software, {"nix"}, "software")
+    nix = table(software.get("nix"), "software.nix")
+    keys(nix, {"enabled", "version", "store_dir", "packages", "settings"}, "software.nix")
+    nix_enabled = boolean(nix.get("enabled", False), "software.nix.enabled")
+    nix_version = ""
+    nix_packages: list[str] = []
+    nix_config = ""
+    if nix_enabled:
+        nix_version = string(nix.get("version", "2.35.4"), "software.nix.version")
+        if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", nix_version):
+            raise ConfigError("software.nix.version must be a numeric version")
+        nix_source = host_path(
+            string(nix.get("store_dir", "${HOME}/.local/share/harness-container/nix"), "software.nix.store_dir"),
+            values,
+            config_path.parent,
+        )
+        mounts.append(mount(nix_source, "/nix", "rw", True))
+        nix_packages = strings(nix.get("packages", []), "software.nix.packages")
+        if any(not NIX_PACKAGE.fullmatch(package) for package in nix_packages):
+            raise ConfigError("Nix package references contain unsupported characters")
+        settings = table(nix.get("settings"), "software.nix.settings")
+        lines = []
+        for key, value in settings.items():
+            if not NIX_KEY.fullmatch(key) or not isinstance(value, str) or "\n" in value or "\r" in value:
+                raise ConfigError(f"Invalid Nix setting: {key}")
+            lines.append(f"{key} = {value}")
+        if "experimental-features" not in settings:
+            lines.append("experimental-features = nix-command flakes")
+        nix_config = "\n".join(lines)
+
+    check_mounts(mounts)
+    uid = os.getuid() if hasattr(os, "getuid") else 1000
+    gid = os.getgid() if hasattr(os, "getgid") else 1000
+    command = [engine, "run", "--rm"]
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        command.append("-it")
+    command += ["--platform", values["CONTAINER_PLATFORM"].replace("-", "/", 1)]
+    if engine == "podman" and system == "linux":
+        command += ["--userns", "keep-id", "--user", "0:0"]
+    command += ["--workdir", target, "--env", "HOME=/home/agent", "--env", f"HC_UID={uid}", "--env", f"HC_GID={gid}"]
+    if os.environ.get("TERM"):
+        command += ["--env", f"TERM={os.environ['TERM']}"]
+    if nix_enabled:
+        command += ["--env", "HC_NIX_ENABLED=1", "--env", f"HC_NIX_VERSION={nix_version}"]
+        command += ["--env", f"HC_PLATFORM={values['CONTAINER_PLATFORM']}"]
+        if nix_packages:
+            command += ["--env", "HC_NIX_PACKAGES=" + "\n".join(nix_packages)]
+        if nix_config:
+            command += ["--env", "HC_NIX_CONFIG=" + nix_config]
+    for item in mounts:
+        spec = f"type=bind,source={item['source']},target={item['target']}"
+        if item["mode"] == "ro":
+            spec += ",readonly"
+        command += ["--mount", spec]
+    tag = image_tag(name)
+    command += [tag, COMMANDS[name], *args]
+    return {"engine": engine, "harness": name, "image": tag, "mounts": mounts, "command": command}
+
+
+def ensure_image(plan: dict, rebuild: bool) -> None:
+    engine, tag = plan["engine"], plan["image"]
+    if not rebuild:
+        found = subprocess.run([engine, "image", "inspect", tag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if found.returncode == 0:
+            return
+    print(f"Building {tag}...", file=sys.stderr)
+    subprocess.run(
+        [engine, "build", "-f", str(ROOT / "Containerfile"), "--build-arg", f"HARNESS={plan['harness']}", "-t", tag, str(ROOT)],
+        check=True,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, help="TOML config (default: ./harness.toml)")
+    parser.add_argument("--dry-run", action="store_true", help="Print the plan without creating files or starting a container")
+    parser.add_argument("--rebuild", action="store_true", help="Rebuild the internal container image")
+    parser.add_argument("harness_args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to the harness")
+    options = parser.parse_args()
+    cwd = Path.cwd().resolve()
+    config_path = (options.config or cwd / "harness.toml").resolve()
+    args = options.harness_args
+    if args and args[0] == "--":
+        args = args[1:]
+    try:
+        config = load_config(config_path)
+        plan = make_plan(config, config_path, cwd, options.dry_run, args)
+        if options.dry_run:
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+            return 0
+        prepare(plan)
+        ensure_image(plan, options.rebuild)
+        return subprocess.run(plan["command"]).returncode
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

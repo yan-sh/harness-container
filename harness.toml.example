@@ -1,0 +1,29 @@
+version = 1
+
+[harness]
+name = "codex"                 # claude | codex | opencode | pi
+args = []
+
+[harness.state]
+enabled = true
+# paths = ["${HOME}/.codex"]
+
+[runtime]
+engine = "auto"                # auto | docker | podman
+
+[workspace]
+# target = "/project"          # default: /<name of launch directory>
+
+# [[mounts]]
+# source = "${HOME}/datasets"
+# target = "/data"
+# mode = "ro"                  # ro (default) | rw
+# create = false
+
+[software.nix]
+enabled = false
+store_dir = "${HOME}/.local/share/harness-container/nix"
+packages = []                   # for example: ["nixpkgs#jq"]
+
+[software.nix.settings]
+experimental-features = "nix-command flakes"

@@ -1,0 +1,22 @@
+version = 1
+
+[harness]
+name = "codex"
+args = []
+
+[harness.state]
+enabled = true
+
+[runtime]
+engine = "auto"
+
+[workspace]
+# target = "/project"
+
+[software.nix]
+enabled = false
+store_dir = "${HOME}/.local/share/harness-container/nix"
+packages = []
+
+[software.nix.settings]
+experimental-features = "nix-command flakes"
